@@ -23,6 +23,8 @@ from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskG
 
 # "/Users/jonathanzulluna/Desktop/Work Code/MSX Project/Data/Oyster Scans/Test 20X/U18068-24 A_01.vsi"
 
+torch.set_default_dtype(torch.float32)
+
 # --- SCRIPT CONFIGURATION ---
 # Paths
 ORIGINAL_WSI_PATH = "data/oyster_slide_uncompressed.ome.tif"
@@ -217,27 +219,41 @@ def get_level_for_target_mag(base_mag, target_mag, known_downsamples):
 
     return best_level_idx, closest_downsample
 
-def load_sam_automask_generator(checkpoint_path, model_type, points_per_side=32, pred_iou_thresh=0.88, stability_score_thresh=0.95, min_mask_region_area=100): # Added min_mask_region_area
+def load_sam_automask_generator(
+        checkpoint_path,
+        model_type,
+        points_per_side=32,
+        pred_iou_thresh=0.88,
+        stability_score_thresh=0.95,
+        min_mask_region_area=100,
+        points_per_batch=64,
+        box_nms_thresh=0.7,
+        crop_n_layers=0,
+        crop_nms_thresh=0.7,
+        output_mode="binary_mask"
+):
     """Initializes and returns the SAM AutomaticMaskGenerator."""
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using SAM device for AutomaticMaskGenerator: {device}")
     try:
         print("Loading SAM model for AutomaticMaskGenerator...")
         sam_model = sam_model_registry[model_type](checkpoint=checkpoint_path)
+        if device == "mps":
+            sam_model.to(torch.float32)  # Ensure model parameters are float32 before moving to MPS
+            # print("  ⚠️ Note: MPS backend requires float32 precision for SAM models.")
+            mask_generator = SamAutomaticMaskGenerator(
+                model=sam_model,
+                points_per_side=points_per_side,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                min_mask_region_area=min_mask_region_area,
+                points_per_batch=points_per_batch,
+                box_nms_thresh=box_nms_thresh,
+                crop_n_layers=crop_n_layers,
+                crop_nms_thresh=crop_nms_thresh,
+                output_mode=output_mode,
+            )
         sam_model.to(device=device)
-        mask_generator = SamAutomaticMaskGenerator(
-            model=sam_model,
-            points_per_side=points_per_side,
-            pred_iou_thresh=pred_iou_thresh,
-            stability_score_thresh=stability_score_thresh,
-            min_mask_region_area=min_mask_region_area # Filter out very small masks
-            # Other parameters to consider tuning:
-            # points_per_batch=64,
-            # box_nms_thresh=0.7,
-            # crop_n_layers=0, # 0: no crops, 1: run on crops and full image
-            # crop_nms_thresh=0.7,
-            # output_mode="binary_mask" # or "uncompressed_rle", "coco_rle"
-        )
         print("SAM AutomaticMaskGenerator loaded successfully.")
         return mask_generator
     except FileNotFoundError:
@@ -267,10 +283,15 @@ if __name__ == "__main__":
     print("--- Stage 2: Intra-Oyster Region Segmentation ---")
     os.makedirs(OUTPUT_DIR_STAGE2, exist_ok=True)
 
-    # 1. Load SAM Predictor (can add AutomaticMaskGenerator later if needed)
-    sam_predictor = load_sam_predictor(SAM_CHECKPOINT_PATH, SAM_MODEL_TYPE)
-    if not sam_predictor:
-        print("🛑 SAM model could not be initialized. Exiting.")
+    # 1. Load SAM (Predictor for later, MaskGenerator for now)
+    # sam_predictor = load_sam_predictor(SAM_CHECKPOINT_PATH, SAM_MODEL_TYPE)
+    # if not sam_predictor:
+    #     print("🛑 SAM Predictor could not be initialized. Exiting.")
+    #     exit()
+
+    sam_mask_generator = load_sam_automask_generator(SAM_CHECKPOINT_PATH, SAM_MODEL_TYPE)
+    if not sam_mask_generator:
+        print("🛑 SAM AutomaticMaskGenerator could not be initialized. Exiting.")
         exit()
 
     # 2. Load the original WSI
@@ -279,7 +300,7 @@ if __name__ == "__main__":
         MANUAL_WSI_OBJECTIVE_POWER
     )
 
-    if not wsi_file_obj:  # Check if the TiffFile object was loaded
+    if not wsi_file_obj:
         print("🛑 WSI could not be loaded. Exiting.")
         exit()
 
@@ -301,10 +322,10 @@ if __name__ == "__main__":
     print(f"  Instance Mask (Stage 1): {TARGET_INSTANCE_MASK_FILENAME} (shape: {oyster_instance_mask_stage1_res.shape})")
     print(f"  Stage 1 Downsample Factor (for mask scaling): {STAGE1_DOWNSAMPLE_FACTOR}")
 
-    best_level_for_patches = 0
-    actual_downsample_at_level = 1.0
-    effective_magnification = base_wsi_magnification
-    dimensions_of_patching_level = wsi_level_dimensions[0]
+    best_level_for_patches = -1
+    actual_downsample_at_level = -1.0
+    effective_magnification = -1.0
+    dimensions_of_patching_level = (0,0)
 
     if base_wsi_magnification and TARGET_MAGNIFICATION and wsi_level_downsamples:
         try:
@@ -325,13 +346,19 @@ if __name__ == "__main__":
             print(f"\tEffective magnification at this level: {effective_magnification:.2f}x")
             print(f"\tDimensions of this level (W,H): {dimensions_of_patching_level}")
         except Exception as e:
-            print(f"Error calculating best level: {e}. Defaulting to level 0.")
-            best_level_for_patches = 0
-            actual_downsample_at_level = wsi_level_downsamples[0] if wsi_level_downsamples else 1.0
-            effective_magnification = base_wsi_magnification / actual_downsample_at_level
-            dimensions_of_patching_level = wsi_level_dimensions[0] if wsi_level_dimensions else (0, 0)
+            print(f"Error calculating best level: {e}. Exiting.")
+            wsi_file_obj.close()
+            exit()
+
+            # print(f"Error calculating best level: {e}. Defaulting to level 0.")
+            # best_level_for_patches = 0
+            # actual_downsample_at_level = wsi_level_downsamples[0] if wsi_level_downsamples else 1.0
+            # effective_magnification = base_wsi_magnification / actual_downsample_at_level
+            # dimensions_of_patching_level = wsi_level_dimensions[0] if wsi_level_dimensions else (0, 0)
     else:
         print("Could not determine best patching level due to missing magnification or downsample info.")
+        wsi_file_obj.close()
+        exit()
 
     # test_level_idx = 0  # Try 0, then maybe 2, etc.
     # print(f"DEBUG: Attempting to read level {test_level_idx} directly...")
@@ -343,6 +370,7 @@ if __name__ == "__main__":
     #     print(f"DEBUG: Error reading level {test_level_idx}: {e_debug}")
 
     # --- MASK SCALING (to the chosen best_level_for_patches resolution) ---
+    scaled_instance_mask_for_patching_binary = None
     if actual_downsample_at_level > 0:
         print(f"\nScaling Stage 1 mask to the resolution of WSI Level {best_level_for_patches}...")
         # dimensions_of_patching_level is (Width, Height)
@@ -356,33 +384,35 @@ if __name__ == "__main__":
             scaled_instance_mask_for_patching, 127, 255, cv2.THRESH_BINARY
         )
         print(
-            f"Scaled Stage 1 mask to Level {best_level_for_patches} resolution, new shape: {scaled_instance_mask_for_patching_binary.shape}")
+            f"Scaled Stage 1 mask to Level {best_level_for_patches} resolution, new shape: {scaled_instance_mask_for_patching_binary.shape}"
+        )
 
-        if ENABLE_PLOTTING:
-            try:
-                # Load the actual image plane we will be patching from for visualization
-                image_plane_for_patching = wsi_file_obj.series[0].levels[best_level_for_patches].asarray()
-                if image_plane_for_patching.ndim == 3 and image_plane_for_patching.shape[2] == 4:  # RGBA
-                    image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_RGBA2RGB)
-                elif image_plane_for_patching.ndim == 2:  # Grayscale
-                    image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_GRAY2RGB)
-                # Add other conversions if needed (e.g. if image_plane_for_patching.shape[2] == 1)
-
-                plt.figure(figsize=(12, 12))
-                overlay_viz = image_plane_for_patching.copy()
-                # Ensure mask_viz_rgb is created correctly for overlay
-                mask_for_viz_rgb = np.zeros_like(image_plane_for_patching)
-                mask_for_viz_rgb[scaled_instance_mask_for_patching_binary == 255] = [255, 0,
-                                                                                     0]  # Red where mask is white
-
-                alpha = 0.3
-                cv2.addWeighted(mask_for_viz_rgb, alpha, overlay_viz, 1 - alpha, 0, overlay_viz)
-                plt.imshow(overlay_viz)
-                plt.title(
-                    f"Scaled Stage 1 Mask Overlaid on Patching Level {best_level_for_patches} (~{effective_magnification:.2f}x)")
-                plt.show()
-            except Exception as e_plot:
-                print(f"Error generating overlay plot for scaled mask: {e_plot}")
+        # Uncomment for debugging/visualization
+        # if ENABLE_PLOTTING:
+        #     try:
+        #         # Load the actual image plane we will be patching from for visualization
+        #         image_plane_for_patching = wsi_file_obj.series[0].levels[best_level_for_patches].asarray()
+        #         if image_plane_for_patching.ndim == 3 and image_plane_for_patching.shape[2] == 4:  # RGBA
+        #             image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_RGBA2RGB)
+        #         elif image_plane_for_patching.ndim == 2:  # Grayscale
+        #             image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_GRAY2RGB)
+        #         # Add other conversions if needed (e.g. if image_plane_for_patching.shape[2] == 1)
+        #
+        #         plt.figure(figsize=(12, 12))
+        #         overlay_viz = image_plane_for_patching.copy()
+        #         # Ensure mask_viz_rgb is created correctly for overlay
+        #         mask_for_viz_rgb = np.zeros_like(image_plane_for_patching)
+        #         mask_for_viz_rgb[scaled_instance_mask_for_patching_binary == 255] = [255, 0,
+        #                                                                              0]  # Red where mask is white
+        #
+        #         alpha = 0.3
+        #         cv2.addWeighted(mask_for_viz_rgb, alpha, overlay_viz, 1 - alpha, 0, overlay_viz)
+        #         plt.imshow(overlay_viz)
+        #         plt.title(
+        #             f"Scaled Stage 1 Mask Overlaid on Patching Level {best_level_for_patches} (~{effective_magnification:.2f}x)")
+        #         plt.show()
+        #     except Exception as e_plot:
+        #         print(f"Error generating overlay plot for scaled mask: {e_plot}")
     else:
         print("Could not perform mask scaling due to invalid actual_downsample_at_level.")
         wsi_file_obj.close()
@@ -391,7 +421,7 @@ if __name__ == "__main__":
 
     # --- Load the entire image plane for patching ONCE ---
     image_plane_for_patching = None
-    if best_level_for_patches >= 0 and best_level_for_patches < len(wsi_file_obj.series[0].levels):
+    if best_level_for_patches != -1:  # Check if best_level was determined
         print(f"\nLoading entire image plane for WSI Level {best_level_for_patches} for patching...")
         try:
             image_plane_for_patching = wsi_file_obj.series[0].levels[best_level_for_patches].asarray()
@@ -401,6 +431,18 @@ if __name__ == "__main__":
                 image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_GRAY2RGB)
             # Add other conversions if needed (e.g. if image_plane_for_patching.shape[2] == 1 for some TIFFs)
             print(f"Successfully loaded image plane for patching, shape: {image_plane_for_patching.shape}")
+
+            if ENABLE_PLOTTING:  # Show overlay plot
+                plt.figure(figsize=(12, 12))
+                overlay_viz = image_plane_for_patching.copy()
+                mask_for_viz_rgb = np.zeros_like(image_plane_for_patching)
+                mask_for_viz_rgb[scaled_instance_mask_for_patching_binary == 255] = [255, 0, 0]
+                alpha = 0.3
+                cv2.addWeighted(mask_for_viz_rgb, alpha, overlay_viz, 1 - alpha, 0, overlay_viz)
+                plt.imshow(overlay_viz)
+                plt.title(
+                    f"Scaled Stage 1 Mask Overlaid on Patching Level {best_level_for_patches} (~{effective_magnification:.2f}x)")
+                plt.show()
         except Exception as e_load_plane:
             print(f"🛑 Error loading entire image plane for level {best_level_for_patches}: {e_load_plane}")
             image_plane_for_patching = None  # Ensure it's None if loading failed
@@ -415,7 +457,7 @@ if __name__ == "__main__":
 
     print("\n--- Phase 2.2: Generating Patch Coordinates and Extracting Patches ---")
 
-    valid_patches_coords_and_data = []  # Store dicts with coords and patch data
+    valid_patches_info = []  # Store dicts with coords and patch data
 
     level_height = dimensions_of_patching_level[1]  # From earlier calculation
     level_width = dimensions_of_patching_level[0]  # From earlier calculation
@@ -437,7 +479,6 @@ if __name__ == "__main__":
 
     patch_count = 0
     valid_patch_count = 0
-
     for y_coord in range(0, level_height - PATCH_SIZE + 1, step_size):
         for x_coord in range(0, level_width - PATCH_SIZE + 1, step_size):
             patch_count += 1
@@ -463,7 +504,7 @@ if __name__ == "__main__":
                 # --- END CORRECTED PATCH EXTRACTION ---
 
                 # Store coordinates and the patch data itself
-                valid_patches_coords_and_data.append({
+                valid_patches_info.append({
                     "x": x_coord, "y": y_coord,
                     "level": best_level_for_patches,
                     "patch_filename_prefix": f"patch_lvl{best_level_for_patches}_x{x_coord}_y{y_coord}",
@@ -479,14 +520,72 @@ if __name__ == "__main__":
 
     print(f"\nPatch generation complete.")
     print(f"  Total potential patch locations checked: {patch_count}")
-    print(f"  Number of valid patches found: {len(valid_patches_coords_and_data)}")
-    if valid_patches_coords_and_data and ENABLE_PLOTTING:
-        print(f"  (Displayed first {min(5, len(valid_patches_coords_and_data))} valid patches for visualization)")
+    print(f"  Number of valid patches found: {len(valid_patches_info)}")
+    if valid_patches_info:
+        print(f"  (Displayed first {min(5, len(valid_patches_info))} valid patches for visualization)")
 
-    # --- Phase 2.3: Process Each Patch with SAM ---
-    print("\n--- Stage 2 Ready for SAM processing on extracted patches ---")
+        # --- Phase 2.3: Process Each Patch with SAM AutomaticMaskGenerator ---
+        print("\n--- Phase 2.3: Processing Patches with SAM AutomaticMaskGenerator ---")
+        # Create a subdirectory for this specific oyster instance's patch results
+        instance_output_dir = os.path.join(OUTPUT_DIR_STAGE2, os.path.splitext(TARGET_INSTANCE_MASK_FILENAME)[0])
+        os.makedirs(instance_output_dir, exist_ok=True)
 
+        # Limit processing for now to a few patches for quick testing
+        num_patches_to_process_with_sam = min(10, len(valid_patches_info))  # Process first 5 or fewer
+        print(f"Will process first {num_patches_to_process_with_sam} valid patches with SAM AutomaticMaskGenerator...")
 
-    if wsi_file_obj:
-        wsi_file_obj.close()
-        print("Closed WSI file object.")
+        for i, patch_info in enumerate(valid_patches_info[:num_patches_to_process_with_sam]):
+            patch_image = patch_info['data']
+            patch_filename_prefix = patch_info['patch_filename_prefix']
+            print(f"\nProcessing patch {i + 1}/{num_patches_to_process_with_sam}: {patch_filename_prefix}")
+
+            # SAM expects uint8 HWC images
+            if patch_image.dtype != np.uint8:
+                print(f"  Patch dtype is {patch_image.dtype}, converting to uint8.")
+                if patch_image.max() <= 1.0 and patch_image.min() >= 0.0:  # float 0-1
+                    patch_image_uint8 = (patch_image * 255).astype(np.uint8)
+                else:  # General case
+                    patch_image_uint8 = np.clip(patch_image, 0, 255).astype(np.uint8)
+            else:
+                patch_image_uint8 = patch_image
+
+            if patch_image_uint8.ndim == 3 and patch_image_uint8.shape[2] == 1:  # Grayscale with extra dim
+                patch_image_uint8 = cv2.cvtColor(patch_image_uint8, cv2.COLOR_GRAY2RGB)
+            elif patch_image_uint8.ndim == 2:  # Grayscale
+                patch_image_uint8 = cv2.cvtColor(patch_image_uint8, cv2.COLOR_GRAY2RGB)
+
+            if sam_mask_generator:
+                print(f"  Running SAM AutomaticMaskGenerator on patch...")
+                generated_masks_anns = sam_mask_generator.generate(patch_image_uint8)
+                print(f"  SAM generated {len(generated_masks_anns)} masks for this patch.")
+
+                if generated_masks_anns:
+                    patch_output_sub_dir = os.path.join(instance_output_dir, patch_filename_prefix)
+                    os.makedirs(patch_output_sub_dir, exist_ok=True)
+
+                    # Option 1: Save individual masks as PNGs
+                    for j, ann in enumerate(generated_masks_anns):
+                        mask_data = ann['segmentation']  # boolean mask
+                        # Include area and predicted_iou in filename for easier sorting/filtering later
+                        mask_save_path = os.path.join(
+                            patch_output_sub_dir,
+                            f"mask_{j:03d}_area_{ann['area']}_iou_{ann['predicted_iou']:.2f}.png"
+                        )
+                        cv2.imwrite(mask_save_path, mask_data.astype(np.uint8) * 255)
+                    print(f"  Saved {len(generated_masks_anns)} individual masks to {patch_output_sub_dir}")
+
+                if ENABLE_PLOTTING and generated_masks_anns:
+                    fig, ax = plt.subplots(figsize=(8, 8))
+                    ax.imshow(patch_image_uint8)
+                    show_anns(generated_masks_anns, ax)  # Use the helper function
+                    ax.set_title(f"SAM Auto-Masks for {patch_filename_prefix}")
+                    ax.axis('off')
+                    # plt.show()
+                    plt.savefig(os.path.join(patch_output_sub_dir, patch_filename_prefix + "_plot.png"))
+                    print("Saved SAM mask overlay plot for this patch.")
+
+        print("\n--- Stage 2 SAM Processing (Limited Run) Complete ---")
+
+        if wsi_file_obj:
+            wsi_file_obj.close()
+            print("Closed WSI file object.")
