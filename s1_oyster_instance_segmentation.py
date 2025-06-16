@@ -26,7 +26,7 @@ import torch
 from segment_anything import sam_model_registry, SamPredictor
 
 # --- SCRIPT CONFIGURATION ---
-INPUT_WSI_PATH = "data/oyster_slide_downsampled_32x.png" # Path to the downsampled WSI
+INPUT_WSI_PATH = "data/oyster10_ds.png" # Path to the downsampled WSI
 SAM_CHECKPOINT_PATH = "pretrained_checkpoint/sam_vit_h_4b8939.pth" # Path to SAM checkpoint
 SAM_MODEL_TYPE = "vit_h" # SAM model type (e.g., "vit_h", "vit_l", "vit_b")
 OUTPUT_MASK_DIR = "oyster_instance_masks_sam" # Directory to save SAM-generated masks
@@ -109,8 +109,12 @@ def apply_morphological_operations(binary_image):
         plt.show()
     return opened_image
 
-def get_oyster_bounding_boxes(binary_mask_opened, original_rgb_image, num_oysters=2):
-    """Finds contours, filters them, and returns bounding boxes for the largest ones."""
+def get_oyster_prompts(binary_mask_opened, original_rgb_image, num_oysters=2):
+    """
+    Finds contours, filters them, and returns:
+    1. Bounding boxes for the largest contours (for SAM).
+    2. The selected contours themselves (for direct mask creation).
+    """
     if binary_mask_opened is None or original_rgb_image is None: return []
 
     contours, _ = cv2.findContours(binary_mask_opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -118,7 +122,7 @@ def get_oyster_bounding_boxes(binary_mask_opened, original_rgb_image, num_oyster
 
     if not contours:
         print("🛑 No contours found.")
-        return []
+        return [], []
 
     min_area = MIN_CONTOUR_AREA_PERCENTAGE * original_rgb_image.shape[0] * original_rgb_image.shape[1]
     print(f"Minimum contour area threshold: {min_area:.2f} pixels")
@@ -127,9 +131,12 @@ def get_oyster_bounding_boxes(binary_mask_opened, original_rgb_image, num_oyster
     print(f"Found {len(valid_contours)} contours above area threshold.")
 
     if len(valid_contours) < num_oysters:
-        print(f"🛑 Expected {num_oysters} oysters, but found only {len(valid_contours)} valid contours. Adjust parameters or check image.")
+        print(f"⚠️ Expected {num_oysters} oysters, but found only {len(valid_contours)} valid contours. Adjust parameters or check image.")
         # Optionally, take all valid contours if fewer than num_oysters
         selected_contours = sorted(valid_contours, key=cv2.contourArea, reverse=True)
+    elif not valid_contours:  # No valid contours at all
+        print(f"🛑 No valid contours found after area filtering.")
+        return [], []
     else:
         selected_contours = sorted(valid_contours, key=cv2.contourArea, reverse=True)[:num_oysters]
 
@@ -138,32 +145,108 @@ def get_oyster_bounding_boxes(binary_mask_opened, original_rgb_image, num_oyster
     bounding_boxes = []
     if ENABLE_PLOTTING and selected_contours:
         contour_img_viz = original_rgb_image.copy()
-        cv2.drawContours(contour_img_viz, contours, -1, (0,255,0), 3) # All contours in green
+        # Draw ALL initially found contours in a light color (e.g., yellow) for context
+        cv2.drawContours(contour_img_viz, contours, -1, (255, 255, 0), 1)  # Thin yellow
+        # Draw selected contours more prominently (e.g., green)
+        cv2.drawContours(contour_img_viz, selected_contours, -1, (0, 255, 0), 3)  # Thicker green
+
         plt.figure(figsize=(10,10))
         plt.imshow(contour_img_viz)
-        plt.title("All Detected Contours")
+        plt.title("All (Yellow) & Selected (Green) Contours")
         plt.axis('off')
         plt.show()
 
         contour_img_viz_selected = original_rgb_image.copy()
-
-    for i, cnt in enumerate(selected_contours):
-        x, y, w, h = cv2.boundingRect(cnt)
-        bounding_boxes.append([x, y, x + w, y + h]) # SAM format: [X_min, Y_min, X_max, Y_max]
-        if ENABLE_PLOTTING:
+        for i, cnt in enumerate(selected_contours):
+            x, y, w, h = cv2.boundingRect(cnt)
+            bounding_boxes.append([x, y, x + w, y + h])
             cv2.rectangle(contour_img_viz_selected, (x, y), (x + w, y + h), (255, 0, 0), 5)
-            cv2.putText(contour_img_viz_selected, f"Oyster Candidate {i+1}", (x, y - 10),
+            cv2.putText(contour_img_viz_selected, f"Oyster Candidate {i + 1}", (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
-
-    if ENABLE_PLOTTING and selected_contours:
         plt.figure(figsize=(12, 12))
         plt.imshow(contour_img_viz_selected)
         plt.title(f"Selected {len(selected_contours)} Oyster Contours with Bounding Boxes")
         plt.axis('off')
         plt.show()
 
+    # Generate bounding boxes even if plotting is disabled
+    if not bounding_boxes and selected_contours:  # If boxes weren't made during plotting
+        for cnt in selected_contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            bounding_boxes.append([x, y, x + w, y + h])
+
     print(f"Generated Bounding Boxes: {bounding_boxes}")
-    return bounding_boxes
+    return bounding_boxes, selected_contours
+
+def create_and_save_contour_masks(selected_contours, original_rgb_image, output_dir, original_image_filename="oyster"):
+    """Creates filled masks from contours and saves them."""
+    if not selected_contours:
+        print("No selected contours to create masks from.")
+        return [] # Return empty list if no masks created
+
+    contour_masks_dir = os.path.join(output_dir, "contour_based_masks") # Subdirectory
+    os.makedirs(contour_masks_dir, exist_ok=True)
+    print(f"\nSaving {len(selected_contours)} contour-based masks to {contour_masks_dir}...")
+    base_name = os.path.splitext(os.path.basename(original_image_filename))[0]
+    generated_masks = []
+
+    # Determine figure size for plotting side-by-side if multiple contours
+    num_masks_to_plot = len(selected_contours)
+    if ENABLE_PLOTTING and num_masks_to_plot > 0:
+        plt.figure(figsize=(7 * num_masks_to_plot, 7))  # Similar to SAM plot
+
+    for i, contour in enumerate(selected_contours):
+        # Create a blank image (all zeros) with the same dimensions as the original
+        mask = np.zeros(original_rgb_image.shape[:2], dtype=np.uint8) # Use only H, W for grayscale mask
+
+        # Draw the contour filled in white (255) on the blank mask
+        cv2.drawContours(mask, [contour], -1, (255), thickness=cv2.FILLED)
+        generated_masks.append(mask.astype(bool)) # Store as boolean mask for consistency
+
+        mask_filename = os.path.join(contour_masks_dir, f"{base_name}_oyster_{i+1}_contour_mask.png")
+        try:
+            cv2.imwrite(mask_filename, mask)
+            print(f"Saved: {mask_filename}")
+        except Exception as e:
+            print(f"🛑 Error saving contour mask {mask_filename}: {e}")
+
+        # Visualization similar to SAM masks
+        if ENABLE_PLOTTING:
+            ax = plt.subplot(1, num_masks_to_plot, i + 1)
+            ax.imshow(original_rgb_image)  # Show the original RGB image
+
+            # Create an RGBA overlay for the contour mask
+            h, w = mask.shape
+            mask_overlay_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            # Use the boolean mask for indexing
+            contour_mask_bool = mask.astype(bool)
+
+            # Choose a color for the mask (can use same alternating logic as SAM)
+            color = [0, 255, 0] if i % 2 == 0 else [0, 0, 255]  # Green for first, Blue for second
+
+            mask_overlay_rgba[contour_mask_bool, 0] = color[0]  # R
+            mask_overlay_rgba[contour_mask_bool, 1] = color[1]  # G
+            mask_overlay_rgba[contour_mask_bool, 2] = color[2]  # B
+            mask_overlay_rgba[contour_mask_bool, 3] = 150  # Alpha (transparency)
+
+            ax.imshow(mask_overlay_rgba)
+
+            # Optionally, draw the bounding box of this contour for direct comparison to SAM's input
+            x, y, w_rect, h_rect = cv2.boundingRect(contour)  # Get bounding rect of the contour itself
+            rect = plt.Rectangle((x, y), w_rect, h_rect,
+                                 fill=False, edgecolor='magenta', linewidth=1,
+                                 linestyle='--')  # Different color/style
+            ax.add_patch(rect)
+
+            ax.set_title(f"Oyster {i + 1} - Contour-based Mask")
+            ax.axis('off')
+
+    if ENABLE_PLOTTING and num_masks_to_plot > 0:
+        plt.tight_layout()
+        plt.show()
+
+    print("Contour-based mask creation, visualization, and saving complete.")
+    return generated_masks
 
 def initialize_sam_predictor(checkpoint_path, model_type):
     """Initializes and returns the SAM predictor."""
@@ -249,28 +332,30 @@ def predict_and_visualize_masks(predictor, rgb_image, bounding_boxes):
         plt.show()
     return sam_masks, sam_scores
 
-def save_masks(masks, scores, output_dir, original_image_filename="oyster"):
-    """Saves the generated boolean masks as PNG files."""
+def save_sam_masks(masks, scores, output_dir, original_image_filename="oyster"):
+    """Saves the SAM-generated boolean masks as PNG files."""
     if not masks:
-        print("No masks to save.")
+        print("No SAM masks to save.")
         return
 
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"\nSaving {len(masks)} SAM masks to {output_dir}...")
+    sam_masks_dir = os.path.join(output_dir, "sam_generated_masks") # Subdirectory
+    os.makedirs(sam_masks_dir, exist_ok=True) # Create if it doesn't exist
+    print(f"\nSaving {len(masks)} SAM masks to {sam_masks_dir}...")
     base_name = os.path.splitext(os.path.basename(original_image_filename))[0]
 
     for i, (mask_bool, score) in enumerate(zip(masks, scores)):
-        if score == 0.0 and not mask_bool.any(): # Skip dummy error masks
-            print(f"Skipping save for Oyster Candidate {i+1} due to previous error or zero score.")
+        if score == 0.0 and not mask_bool.any():
+            print(f"Skipping save for SAM mask (Oyster Candidate {i+1}) due to error or zero score.")
             continue
         mask_to_save = mask_bool.astype(np.uint8) * 255
-        mask_filename = os.path.join(output_dir, f"{base_name}_oyster_{i+1}_sam_mask_score_{score:.3f}.png")
+        # Use a consistent naming, Oyster 1 from SAM corresponds to first contour, etc.
+        mask_filename = os.path.join(sam_masks_dir, f"{base_name}_oyster_{i+1}_sam_mask_score_{score:.3f}.png")
         try:
             cv2.imwrite(mask_filename, mask_to_save)
             print(f"Saved: {mask_filename}")
         except Exception as e:
-            print(f"🛑 Error saving mask {mask_filename}: {e}")
-    print("Mask saving complete.")
+            print(f"🛑 Error saving SAM mask {mask_filename}: {e}")
+    print("SAM mask saving complete.")
 
 if __name__ == "__main__":
     print("--- Stage 1: Oyster Instance Segmentation ---")
@@ -286,7 +371,19 @@ if __name__ == "__main__":
         processed_binary_mask = apply_morphological_operations(binary_tissue_image)
 
         # 4. Get Bounding Box Prompts
-        oyster_bboxes = get_oyster_bounding_boxes(processed_binary_mask, low_res_rgb_image)
+        oyster_bboxes, selected_oyster_contours = get_oyster_prompts(processed_binary_mask, low_res_rgb_image)
+
+        # 4.5 Create and Save Masks directly from Contours
+        contour_generated_masks = []
+        if selected_oyster_contours:
+            contour_generated_masks = create_and_save_contour_masks(
+                selected_oyster_contours,
+                low_res_rgb_image,
+                OUTPUT_MASK_DIR,
+                INPUT_WSI_PATH
+            )
+        else:
+            print("No selected contours to create direct masks from.")
 
         if oyster_bboxes:
             # 5. Initialize SAM
@@ -298,8 +395,8 @@ if __name__ == "__main__":
                     sam_predictor, low_res_rgb_image, oyster_bboxes
                 )
 
-                # 7. Save Masks
-                save_masks(final_oyster_masks, final_oyster_scores, OUTPUT_MASK_DIR, INPUT_WSI_PATH)
+                # 7. Save SAM Masks
+                save_sam_masks(final_oyster_masks, final_oyster_scores, OUTPUT_MASK_DIR, INPUT_WSI_PATH)
             else:
                 print("🛑 SAM predictor initialization failed. Cannot proceed with mask prediction.")
         else:
