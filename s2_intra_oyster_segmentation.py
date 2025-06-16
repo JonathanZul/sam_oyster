@@ -31,10 +31,10 @@ ORIGINAL_WSI_PATH = "data/oyster_slide_uncompressed.ome.tif"
 STAGE1_MASK_DIR = "oyster_instance_masks_sam/sam_generated_masks" # Directory containing masks from Stage 1
 SAM_CHECKPOINT_PATH = "pretrained_checkpoint/sam_vit_h_4b8939.pth"
 SAM_MODEL_TYPE = "vit_h"
-OUTPUT_DIR_STAGE2 = "stage2_intra_oyster_segmentations"
+OUTPUT_DIR_STAGE2 = "stage2_intra_oyster_segmentations_20x"
 
 # WSI & Patching Parameters
-TARGET_MAGNIFICATION = 10.0 # Desired magnification for analysis (e.g., 5.0, 10.0, 20.0)
+TARGET_MAGNIFICATION = 20.0 # Desired magnification for analysis (e.g., 5.0, 10.0, 20.0)
 PATCH_SIZE = 512          # Pixel size of square patches to extract (e.g., 256, 512, 1024)
 PATCH_OVERLAP = 64        # Overlap between patches (e.g., 0 for no overlap, or a portion of patch_size)
 # If your WSI doesn't have objective power in metadata, you'll need to set this manually:
@@ -46,10 +46,10 @@ MANUAL_WSI_OBJECTIVE_POWER = 20.0 # Example: if scanned at 20x. Set to None if a
 TARGET_INSTANCE_MASK_FILENAME = "oyster_slide_downsampled_32x_oyster_1_sam_mask_score_0.955.png"
 
 # Downsample factor used when creating the low_res_image for Stage 1 (needed for mask scaling)
-STAGE1_DOWNSAMPLE_FACTOR = 32.0 # ⚠️ This MUST match the downsample factor used to create the image that Stage 1 masks were made from
+STAGE1_DOWNSAMPLE_FACTOR = 32.0 # !! This MUST match the downsample factor used to create the image that Stage 1 masks were made from
 
 # Control plotting
-ENABLE_PLOTTING = True
+ENABLE_PLOTTING = False
 # --- END SCRIPT CONFIGURATION ---
 
 def load_sam_predictor(checkpoint_path, model_type):
@@ -97,18 +97,11 @@ def load_wsi(wsi_path, manual_objective_power=None):
         print(f"🛑 An unexpected error occurred while opening WSI: {e}")
     return None, None
 
-def load_ome_tiff_pyramid(wsi_path, manual_objective_power=None): # Removed target_magnification, not needed here
+def load_ome_tiff_pyramid(wsi_path, manual_objective_power=None):
     print(f"Loading OME-TIFF with tifffile: {wsi_path}")
     try:
-        # It's better to pass the TiffFile object or the series object out,
-        # rather than reading the whole image with imread here if we want to patch.
-        # Let's open it as a context manager to ensure it's handled properly
-        # and extract the necessary info.
-        # The actual reading of patches will happen later using this info.
-
         tif = tifffile.TiffFile(wsi_path) # Open the file
 
-        # --- Keep the rest of your logic to parse levels ---
         if not tif.is_ome:
             print("Warning: TIFF file does not appear to be an OME-TIFF according to tifffile.")
 
@@ -149,7 +142,7 @@ def load_ome_tiff_pyramid(wsi_path, manual_objective_power=None): # Removed targ
 
         # For now, we return the TiffFile object itself so we can use it later to read regions.
         # The caller will be responsible for closing it.
-        # Or, we can pass the main_series object. Let's pass tif object for now.
+        # Or, we can pass the main_series object.
         return tif, base_magnification, level_dimensions_wh, level_downsamples
 
     except Exception as e:
@@ -181,6 +174,7 @@ def load_stage1_instance_mask(mask_dir, mask_filename, expected_stage1_downsampl
         return mask_low_res_binary
 
 def get_level_for_target_mag(base_mag, target_mag, known_downsamples):
+    """Determines the best WSI level index and downsample factor"""
     if not base_mag or not target_mag:
         return 0, 1.0 # Default to level 0, downsample 1.0
     if target_mag > base_mag:
@@ -190,14 +184,6 @@ def get_level_for_target_mag(base_mag, target_mag, known_downsamples):
     ideal_downsample = base_mag / target_mag
     best_level_idx = 0
     smallest_diff = float('inf')
-
-    # Find the known_downsample that is >= ideal_downsample and closest
-    # Or, if we want the one that results in magnification >= target_mag,
-    # we find the largest downsample that is <= ideal_downsample.
-    # Let's aim for magnification >= target_mag, so pick smallest downsample >= ideal_downsample.
-    # No, it's the other way: to get effective_mag >= target_mag,
-    # we need actual_downsample <= ideal_downsample.
-    # So, we want the largest `ds` in `known_downsamples` such that `ds <= ideal_downsample`.
 
     closest_downsample = 1.0
     for i, ds in enumerate(known_downsamples):
@@ -278,6 +264,7 @@ def show_anns(anns, ax):
             img[:,:,i] = color_mask[i]
         ax.imshow(np.dstack((img, m*0.35))) # Show mask with some transparency
 
+
 # --- Main Execution ---
 if __name__ == "__main__":
     print("--- Stage 2: Intra-Oyster Region Segmentation ---")
@@ -329,7 +316,7 @@ if __name__ == "__main__":
 
     if base_wsi_magnification and TARGET_MAGNIFICATION and wsi_level_downsamples:
         try:
-            # Use the helper function with the loaded downsamples
+            # Use helper function with the loaded downsamples
             best_level_for_patches, actual_downsample_at_level = get_level_for_target_mag(
                 base_wsi_magnification,
                 TARGET_MAGNIFICATION,
@@ -387,32 +374,31 @@ if __name__ == "__main__":
             f"Scaled Stage 1 mask to Level {best_level_for_patches} resolution, new shape: {scaled_instance_mask_for_patching_binary.shape}"
         )
 
-        # Uncomment for debugging/visualization
-        # if ENABLE_PLOTTING:
-        #     try:
-        #         # Load the actual image plane we will be patching from for visualization
-        #         image_plane_for_patching = wsi_file_obj.series[0].levels[best_level_for_patches].asarray()
-        #         if image_plane_for_patching.ndim == 3 and image_plane_for_patching.shape[2] == 4:  # RGBA
-        #             image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_RGBA2RGB)
-        #         elif image_plane_for_patching.ndim == 2:  # Grayscale
-        #             image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_GRAY2RGB)
-        #         # Add other conversions if needed (e.g. if image_plane_for_patching.shape[2] == 1)
-        #
-        #         plt.figure(figsize=(12, 12))
-        #         overlay_viz = image_plane_for_patching.copy()
-        #         # Ensure mask_viz_rgb is created correctly for overlay
-        #         mask_for_viz_rgb = np.zeros_like(image_plane_for_patching)
-        #         mask_for_viz_rgb[scaled_instance_mask_for_patching_binary == 255] = [255, 0,
-        #                                                                              0]  # Red where mask is white
-        #
-        #         alpha = 0.3
-        #         cv2.addWeighted(mask_for_viz_rgb, alpha, overlay_viz, 1 - alpha, 0, overlay_viz)
-        #         plt.imshow(overlay_viz)
-        #         plt.title(
-        #             f"Scaled Stage 1 Mask Overlaid on Patching Level {best_level_for_patches} (~{effective_magnification:.2f}x)")
-        #         plt.show()
-        #     except Exception as e_plot:
-        #         print(f"Error generating overlay plot for scaled mask: {e_plot}")
+        if ENABLE_PLOTTING:
+            try:
+                # Load the actual image plane we will be patching from for visualization
+                image_plane_for_patching = wsi_file_obj.series[0].levels[best_level_for_patches].asarray()
+                if image_plane_for_patching.ndim == 3 and image_plane_for_patching.shape[2] == 4:  # RGBA
+                    image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_RGBA2RGB)
+                elif image_plane_for_patching.ndim == 2:  # Grayscale
+                    image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_GRAY2RGB)
+                # May need other conversions (e.g. if image_plane_for_patching.shape[2] == 1)
+
+                plt.figure(figsize=(12, 12))
+                overlay_viz = image_plane_for_patching.copy()
+                # Ensure mask_viz_rgb is created correctly for overlay
+                mask_for_viz_rgb = np.zeros_like(image_plane_for_patching)
+                mask_for_viz_rgb[scaled_instance_mask_for_patching_binary == 255] = [255, 0,
+                                                                                     0]  # Red where mask is white
+
+                alpha = 0.3
+                cv2.addWeighted(mask_for_viz_rgb, alpha, overlay_viz, 1 - alpha, 0, overlay_viz)
+                plt.imshow(overlay_viz)
+                plt.title(
+                    f"Scaled Stage 1 Mask Overlaid on Patching Level {best_level_for_patches} (~{effective_magnification:.2f}x)")
+                plt.show()
+            except Exception as e_plot:
+                print(f"Error generating overlay plot for scaled mask: {e_plot}")
     else:
         print("Could not perform mask scaling due to invalid actual_downsample_at_level.")
         wsi_file_obj.close()
@@ -429,7 +415,6 @@ if __name__ == "__main__":
                 image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_RGBA2RGB)
             elif image_plane_for_patching.ndim == 2:  # Grayscale
                 image_plane_for_patching = cv2.cvtColor(image_plane_for_patching, cv2.COLOR_GRAY2RGB)
-            # Add other conversions if needed (e.g. if image_plane_for_patching.shape[2] == 1 for some TIFFs)
             print(f"Successfully loaded image plane for patching, shape: {image_plane_for_patching.shape}")
 
             if ENABLE_PLOTTING:  # Show overlay plot
@@ -494,14 +479,12 @@ if __name__ == "__main__":
             if cv2.countNonZero(mask_patch_region) > tissue_threshold_pixels:
                 valid_patch_count += 1
 
-                # --- CORRECTED PATCH EXTRACTION ---
                 # Slice the pre-loaded image_plane_for_patching
                 image_patch_data = image_plane_for_patching[
                                    y_coord: y_coord + PATCH_SIZE,
                                    x_coord: x_coord + PATCH_SIZE,
                                    :  # Select all color channels if present
                                    ]
-                # --- END CORRECTED PATCH EXTRACTION ---
 
                 # Store coordinates and the patch data itself
                 valid_patches_info.append({
@@ -531,7 +514,8 @@ if __name__ == "__main__":
         os.makedirs(instance_output_dir, exist_ok=True)
 
         # Limit processing for now to a few patches for quick testing
-        num_patches_to_process_with_sam = min(10, len(valid_patches_info))  # Process first 5 or fewer
+        NUM_PATCHES = 10 # maybe move to configuration later
+        num_patches_to_process_with_sam = min(NUM_PATCHES, len(valid_patches_info))  # Process first 5 or fewer
         print(f"Will process first {num_patches_to_process_with_sam} valid patches with SAM AutomaticMaskGenerator...")
 
         for i, patch_info in enumerate(valid_patches_info[:num_patches_to_process_with_sam]):
@@ -563,7 +547,7 @@ if __name__ == "__main__":
                     patch_output_sub_dir = os.path.join(instance_output_dir, patch_filename_prefix)
                     os.makedirs(patch_output_sub_dir, exist_ok=True)
 
-                    # Option 1: Save individual masks as PNGs
+                    # Save individual masks as PNGs
                     for j, ann in enumerate(generated_masks_anns):
                         mask_data = ann['segmentation']  # boolean mask
                         # Include area and predicted_iou in filename for easier sorting/filtering later
@@ -574,7 +558,10 @@ if __name__ == "__main__":
                         cv2.imwrite(mask_save_path, mask_data.astype(np.uint8) * 255)
                     print(f"  Saved {len(generated_masks_anns)} individual masks to {patch_output_sub_dir}")
 
-                if ENABLE_PLOTTING and generated_masks_anns:
+                    # Could save as JSON for metadata if needed
+
+                if generated_masks_anns:
+                # if ENABLE_PLOTTING and generated_masks_anns:
                     fig, ax = plt.subplots(figsize=(8, 8))
                     ax.imshow(patch_image_uint8)
                     show_anns(generated_masks_anns, ax)  # Use the helper function
