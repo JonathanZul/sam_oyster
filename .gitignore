@@ -2,4 +2,9 @@
 .venv/
 data/
 pretrained_checkpoint/
+oyster_instance_masks_sam/
+stage2_intra_oyster_segmentations_10x/
+stage2_intra_oyster_segmentations_20x/
+oyster_slide_downsampled_32x.png
+
 
