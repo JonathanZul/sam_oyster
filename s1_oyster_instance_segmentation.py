@@ -19,6 +19,7 @@
 # 4. Run the script: python stage1_oyster_instance_segmentation.py
 
 import numpy as np
+import tifffile
 import os
 os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = pow(2,40).__str__() # Allow large images
 import cv2
@@ -30,13 +31,17 @@ import logging
 import time
 
 # --- SCRIPT CONFIGURATION ---
-INPUT_WSI_DIR = "data/downsampled_wsis/"  # Path to the directory containing downsampled WSI images
+# INPUT_WSI_DIR = "data/downsampled_wsis/"  # Path to the directory containing downsampled WSI images
+INPUT_WSI_DIR = "/Volumes/One Touch/MSX Project/TIFF/test"
 VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff")  # Supported image formats
 SAM_CHECKPOINT_PATH = (
     "pretrained_checkpoint/sam_vit_h_4b8939.pth"  # Path to SAM checkpoint
 )
 SAM_MODEL_TYPE = "vit_h"  # SAM model type (e.g., "vit_h", "vit_l", "vit_b")
 OUTPUT_MASK_PARENT_DIR = "output_stage1_masks_logging"  # Parent directory to save masks for all outputs
+STAGE1_PROCESSING_DOWNSAMPLE = 32.0     # Downsample factor for processing WSI images
+DEBUG_VISUALIZATION_MAX_DIM = 1024       # Max dimension (width or height) for saved debug images. Adjust as needed.
+MANUAL_WSI_OBJECTIVE_POWER = 20.0       # TODO: Same as s2
 
 # Morphological operation parameters
 GAUSSIAN_BLUR_KERNEL_SIZE = (3, 3)
@@ -89,7 +94,8 @@ def setup_logging(log_dir):
 def plot_or_save_debug_image(image_data, title, filename_suffix, current_wsi_output_dir, image_base_name, cmap=None):
     """
     Utility to either plot an image or save it to a 'debug_images' subdirectory.
-    Handles RGB and grayscale images for saving.
+    Handles RGB and grayscale images for saving. Includes logic to downsample
+    images for saving if ENABLE_PLOTTING is False, to create smaller debug files.
 
     :param image_data: The image data to plot or save.
     :param title: Title for the plot (if plotting).
@@ -99,11 +105,11 @@ def plot_or_save_debug_image(image_data, title, filename_suffix, current_wsi_out
     :param cmap: Colormap to use for plotting (if applicable, e.g., 'gray' for grayscale).
     """
     if ENABLE_PLOTTING:
-        plt.figure(figsize=(8, 8) if cmap else (10,10)) # Smaller for grayscale typically
+        plt.figure(figsize=(8, 8) if cmap else (10,10))
         if cmap:
             plt.imshow(image_data, cmap=cmap)
         else:
-            plt.imshow(image_data) # Assumes RGB if no cmap
+            plt.imshow(image_data)
         plt.title(title)
         plt.axis("off")
         plt.show()
@@ -112,24 +118,145 @@ def plot_or_save_debug_image(image_data, title, filename_suffix, current_wsi_out
         os.makedirs(debug_img_dir, exist_ok=True)
         save_path = os.path.join(debug_img_dir, f"{image_base_name}_{filename_suffix}.png")
 
-        try:
-            if image_data.ndim == 3 and image_data.shape[2] == 3: # RGB
-                # OpenCV expects BGR for saving
-                cv2.imwrite(save_path, cv2.cvtColor(image_data, cv2.COLOR_RGB2BGR))   # TODO: need to scale down
-                # pass
-            elif image_data.ndim == 2: # Grayscale or binary
-                cv2.imwrite(save_path, image_data)
-                # pass
+        # --- NEW: Resize image for debug saving ---
+        current_height, current_width = image_data.shape[0], image_data.shape[1]
+        if max(current_height, current_width) > DEBUG_VISUALIZATION_MAX_DIM:
+            # Calculate new dimensions while maintaining aspect ratio
+            if current_width > current_height:
+                new_width = DEBUG_VISUALIZATION_MAX_DIM
+                new_height = int(current_height * (new_width / current_width))
             else:
-                logger.warning(f"Unsupported image format for saving debug image: {filename_suffix}, shape: {image_data.shape}")
+                new_height = DEBUG_VISUALIZATION_MAX_DIM
+                new_width = int(current_width * (new_height / current_height))
+
+            # Ensure new_width and new_height are at least 1 to avoid errors
+            new_width = max(1, new_width)
+            new_height = max(1, new_height)
+
+            resized_image_data = cv2.resize(image_data, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            logger.debug(f"Resized debug image from {current_width}x{current_height} to {new_width}x{new_height} for saving.")
+        else:
+            resized_image_data = image_data # No resizing needed
+        # --- END NEW ---
+
+        try:
+            if resized_image_data.ndim == 3 and resized_image_data.shape[2] == 3: # RGB
+                cv2.imwrite(save_path, cv2.cvtColor(resized_image_data, cv2.COLOR_RGB2BGR))
+            elif resized_image_data.ndim == 2: # Grayscale or binary
+                cv2.imwrite(save_path, resized_image_data)
+            else:
+                logger.warning(f"Unsupported image format for saving debug image: {filename_suffix}, shape: {resized_image_data.shape}")
                 return
-            logger.debug(f"Debug image (WOULD HAVE BEEN) saved: {save_path}")
+            logger.debug(f"Debug image saved: {save_path}") # Changed from "WOULD HAVE BEEN"
         except Exception as e:
             logger.error(f"🔴 Error saving debug image {save_path}: {e}")
 
 
+def extract_downsampled_overview_from_ome_tiff(
+        ome_tiff_path,
+        target_processing_downsample,  # Renamed for clarity
+        manual_objective_power=MANUAL_WSI_OBJECTIVE_POWER
+):
+    logger.info(f"Extracting downsampled overview from: {ome_tiff_path}")
+    logger.info(f"Target processing downsample factor: {target_processing_downsample}")
+    try:
+        with tifffile.TiffFile(ome_tiff_path) as tif:
+            if not tif.is_ome:
+                logger.warning("TIFF is not an OME-TIFF per tifffile.")
+
+            if not tif.series or not tif.series[0].levels:
+                logger.error(f"No image series or levels found in {ome_tiff_path}")
+                return None
+
+            main_series = tif.series[0]
+
+            # Get actual downsamples from the TIFF structure if possible,
+            # otherwise rely on common powers of 2.
+            # For OME-TIFF, often the levels are just numbered 0, 1, 2...
+            # and their downsample is implicitly 2^level_index.
+            # We know from your previous run that QuPath/tifffile saw [1,2,4,8,16,32,64,128,256]
+            # So, we can use these as the *effective* downsamples for these levels.
+
+            available_downsamples = []
+            qupath_like_downsamples = [2 ** i for i in range(len(main_series.levels))]  # Assumes powers of 2
+
+            # Let's verify this against the actual dimensions for more robustness
+            base_width, base_height = main_series.levels[0].shape[1], main_series.levels[0].shape[0]
+            for i in range(len(main_series.levels)):
+                lvl_width, lvl_height = main_series.levels[i].shape[1], main_series.levels[i].shape[0]
+                # Calculate effective downsample based on width (or height)
+                ds_w = base_width / lvl_width if lvl_width > 0 else float('inf')
+                ds_h = base_height / lvl_height if lvl_height > 0 else float('inf')
+                # Use the more conservative (larger) downsample if dimensions aren't perfectly scaled
+                # or average them. For now, let's use the one derived from width.
+                # This also assumes levels are ordered from highest to lowest resolution.
+                if i == 0:
+                    available_downsamples.append(1.0)
+                else:
+                    # Try to match with QuPath-like, or use calculated
+                    if i < len(qupath_like_downsamples) and abs(ds_w - qupath_like_downsamples[i]) < 0.1 * \
+                            qupath_like_downsamples[i]:  # within 10%
+                        available_downsamples.append(float(qupath_like_downsamples[i]))
+                    else:  # Fallback to calculated if not matching typical powers of 2
+                        available_downsamples.append(round(ds_w, 2))  # Round to avoid minor float issues
+
+            logger.info(f"Available effective downsamples in TIFF: {available_downsamples}")
+
+            best_level_idx = -1
+            # Find the smallest downsample factor that is >= target_processing_downsample
+            # This ensures the resulting image is small enough.
+            for i, ds in enumerate(available_downsamples):
+                if ds >= target_processing_downsample:
+                    best_level_idx = i
+                    break
+
+            if best_level_idx == -1:  # Target downsample is larger than any available
+                if available_downsamples:
+                    best_level_idx = len(available_downsamples) - 1  # Pick the lowest resolution available
+                    logger.warning(
+                        f"Target downsample {target_processing_downsample}x is too high. "
+                        f"Using lowest available resolution (Level {best_level_idx}, ~{available_downsamples[best_level_idx]:.1f}x downsample)."
+                    )
+                else:
+                    logger.error("No downsample levels found or processed correctly.")
+                    return None
+
+            actual_downsample_selected = available_downsamples[best_level_idx]
+            logger.info(
+                f"Selected Level {best_level_idx} with actual downsample ~{actual_downsample_selected:.1f}x for processing."
+            )
+            page_to_read = main_series.levels[best_level_idx]
+            overview_image_raw = page_to_read.asarray()
+            # ... (rest of your color conversion logic) ...
+            logger.info(f"Raw overview image shape: {overview_image_raw.shape}")
+
+            # Convert to RGB if necessary
+            if overview_image_raw.ndim == 3 and overview_image_raw.shape[2] == 4:  # RGBA
+                overview_rgb = cv2.cvtColor(overview_image_raw, cv2.COLOR_RGBA2RGB)
+            elif overview_image_raw.ndim == 3 and overview_image_raw.shape[2] == 3:  # RGB
+                overview_rgb = overview_image_raw
+            elif overview_image_raw.ndim == 2:  # Grayscale
+                overview_rgb = cv2.cvtColor(overview_image_raw, cv2.COLOR_GRAY2RGB)
+            else:
+                logger.error(f"Unsupported image format from TIFF page: {overview_image_raw.shape}")
+                return None
+
+            logger.info(f"Extracted RGB overview shape: {overview_rgb.shape}")
+            return overview_rgb
+
+    except Exception as e:
+        logger.error(f"Error extracting downsampled overview from {ome_tiff_path}: {e}",
+                     exc_info=True)  # Add exc_info for full traceback
+        return None
+
+
 def load_image(image_path): # Renamed for clarity, display handled by plot_or_save
-    """Loads an image using OpenCV and converts to RGB."""
+    """
+    Loads an image using OpenCV and converts to RGB.
+
+    :param image_path: Path to the image file.
+    :return: RGB image as a NumPy array, or None if loading fails.
+    """
     logger.info(f"Loading image: {image_path}")
     bgr_image = cv2.imread(image_path)
     if bgr_image is None:
@@ -321,18 +448,49 @@ def create_and_save_contour_masks(
             squeeze=False
         )
 
+        # Apply resizing to original_rgb_image for debug plot background
+        current_height, current_width = original_rgb_image.shape[0], original_rgb_image.shape[1]
+        if max(current_height, current_width) > DEBUG_VISUALIZATION_MAX_DIM:
+            if current_width > current_height:
+                new_width = DEBUG_VISUALIZATION_MAX_DIM
+                new_height = int(current_height * (new_width / current_width))
+            else:
+                new_height = DEBUG_VISUALIZATION_MAX_DIM
+                new_width = int(current_width * (new_height / current_height))
+            new_width = max(1, new_width)
+            new_height = max(1, new_height)
+            display_rgb_image = cv2.resize(original_rgb_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            # Need to also scale masks/bboxes if displaying on resized image
+            scale_factor_x = new_width / current_width
+            scale_factor_y = new_height / current_height
+        else:
+            display_rgb_image = original_rgb_image
+            scale_factor_x, scale_factor_y = 1.0, 1.0
+
         for i, mask in enumerate(generated_masks):
             ax = axes_debug_contour[0, i]
-            ax.imshow(original_rgb_image)
+            ax.imshow(display_rgb_image)  # Use the resized image here
             if mask.any():
-                h_m, w_m = mask.shape
+                # Resize the mask too for overlay
+                resized_mask = cv2.resize(mask.astype(np.uint8),
+                                          (display_rgb_image.shape[1], display_rgb_image.shape[0]),
+                                          interpolation=cv2.INTER_NEAREST).astype(bool)
+
+                h_m, w_m = resized_mask.shape  # Use resized mask shape for overlay
                 mask_overlay_rgba = np.zeros((h_m, w_m, 4), dtype=np.uint8)
                 color = [0, 255, 0] if i % 2 == 0 else [0, 0, 255]
-                mask_overlay_rgba[mask, 0:3] = color
-                mask_overlay_rgba[mask, 3] = 150
+                mask_overlay_rgba[resized_mask, 0:3] = color
+                mask_overlay_rgba[resized_mask, 3] = 150
                 ax.imshow(mask_overlay_rgba)
+
+                # Scale bounding box for display
                 x_r, y_r, w_r, h_r = cv2.boundingRect(selected_contours[i])
-                rect = plt.Rectangle((x_r, y_r), w_r, h_r, fill=False, edgecolor="magenta", linewidth=1, linestyle="--")
+                scaled_x = x_r * scale_factor_x
+                scaled_y = y_r * scale_factor_y
+                scaled_w = w_r * scale_factor_x
+                scaled_h = h_r * scale_factor_y
+                rect = plt.Rectangle((scaled_x, scaled_y), scaled_w, scaled_h, fill=False, edgecolor="magenta",
+                                     linewidth=1, linestyle="--")
                 ax.add_patch(rect)
             ax.set_title(f"Oyster {i + 1} - Contour Mask")
             ax.axis('off')
@@ -341,7 +499,7 @@ def create_and_save_contour_masks(
         os.makedirs(debug_img_dir, exist_ok=True)
         save_path = os.path.join(debug_img_dir, f"{original_image_filename_base}_07_contour_masks_overlay.png")
         fig_debug_contour.savefig(save_path)
-
+        plt.close(fig_debug_contour)  # Important: Close to free memory
     logger.info("Contour-based mask saving complete.")
     return generated_masks
 
@@ -461,22 +619,49 @@ def predict_and_visualize_masks(predictor, rgb_image, bounding_boxes, current_ws
             figsize=(7 * len(sam_masks_list), 7),
             squeeze=False
         )
+        # Apply resizing to rgb_image for debug plot background
+        current_height, current_width = rgb_image.shape[0], rgb_image.shape[1]
+        if max(current_height, current_width) > DEBUG_VISUALIZATION_MAX_DIM:
+            if current_width > current_height:
+                new_width = DEBUG_VISUALIZATION_MAX_DIM
+                new_height = int(current_height * (new_width / current_width))
+            else:
+                new_height = DEBUG_VISUALIZATION_MAX_DIM
+                new_width = int(current_width * (new_height / current_height))
+            new_width = max(1, new_width)
+            new_height = max(1, new_height)
+            display_rgb_image = cv2.resize(rgb_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            scale_factor_x = new_width / current_width
+            scale_factor_y = new_height / current_height
+        else:
+            display_rgb_image = rgb_image
+            scale_factor_x, scale_factor_y = 1.0, 1.0
 
         for i, (mask, score) in enumerate(zip(sam_masks_list, sam_scores_list)):
             ax = axes_debug_sam[0, i]
-            ax.imshow(rgb_image)
+            ax.imshow(display_rgb_image)  # Use the resized image here
             if score > 0 or mask.any():
-                h_m, w_m = mask.shape
+                # Resize the mask too for overlay
+                resized_mask = cv2.resize(mask.astype(np.uint8),
+                                          (display_rgb_image.shape[1], display_rgb_image.shape[0]),
+                                          interpolation=cv2.INTER_NEAREST).astype(bool)
+
+                h_m, w_m = resized_mask.shape  # Use resized mask shape for overlay
                 mask_overlay_rgba = np.zeros((h_m, w_m, 4), dtype=np.uint8)
                 color = [0, 255, 0] if i % 2 == 0 else [0, 0, 255]
-                mask_overlay_rgba[mask, 0:3] = color
-                mask_overlay_rgba[mask, 3] = 150
+                mask_overlay_rgba[resized_mask, 0:3] = color
+                mask_overlay_rgba[resized_mask, 3] = 150
                 ax.imshow(mask_overlay_rgba)
                 box_for_plot = bounding_boxes[i]
+                # Scale bounding box for display
+                scaled_x1 = box_for_plot[0] * scale_factor_x
+                scaled_y1 = box_for_plot[1] * scale_factor_y
+                scaled_x2 = box_for_plot[2] * scale_factor_x
+                scaled_y2 = box_for_plot[3] * scale_factor_y
                 rect = plt.Rectangle(
-                    (box_for_plot[0], box_for_plot[1]),
-                    box_for_plot[2] - box_for_plot[0],
-                    box_for_plot[3] - box_for_plot[1],
+                    (scaled_x1, scaled_y1),
+                    scaled_x2 - scaled_x1,
+                    scaled_y2 - scaled_y1,
                     fill=False,
                     edgecolor='red',
                     linewidth=2
@@ -548,17 +733,21 @@ def process_single_wsi(image_file_path, sam_predictor_instance):
     logger.info(f"Output directory for this image: {current_wsi_output_dir}")
 
     # 1. Load Image
-    low_res_rgb_image = load_image(image_file_path)
+    low_res_rgb_image = extract_downsampled_overview_from_ome_tiff(
+        image_file_path,
+        STAGE1_PROCESSING_DOWNSAMPLE,
+    )
+
     if low_res_rgb_image is None:
-        logger.warning(f"🛑 Image loading failed for {image_file_path}. Skipping this image.")
+        logger.warning(f"🛑 Failed to extract downsampled overview for {image_file_path}. Skipping this image.")
         return
-    # plot_or_save_debug_image(
-    #     low_res_rgb_image,
-    #     f"Loaded: {image_base_name}",
-    #     "00_loaded_image",
-    #     current_wsi_output_dir,
-    #     image_base_name
-    # )         # Do the same in other parts if want to visualize progress of the processing
+    plot_or_save_debug_image(
+        low_res_rgb_image,
+        f"Downsampled Overview for Processing ({image_base_name})",
+        "00_downsampled_overview",
+        current_wsi_output_dir,
+        image_base_name
+    )
 
     # 2. Preprocess for tissue detection
     binary_tissue_image = preprocess_for_tissue_detection(low_res_rgb_image, current_wsi_output_dir, image_base_name)
