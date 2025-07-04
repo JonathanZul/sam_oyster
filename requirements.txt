@@ -9,6 +9,7 @@ fasteners==0.19
 filelock==3.18.0
 fonttools==4.58.2
 fsspec==2025.5.1
+geojson==3.2.0
 imagecodecs==2025.3.30
 importlib_metadata==8.7.0
 Jinja2==3.1.6
@@ -37,6 +38,7 @@ PyYAML==6.0.2
 scikit-image==0.25.2
 scipy==1.15.3
 segment_anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf
+shapely==2.1.1
 six==1.17.0
 slicerator==1.1.0
 sympy==1.14.0
