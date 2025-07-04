@@ -10,4 +10,7 @@ oyster_slide_downsampled_32x.png
 pyrightconfig.json
 package-lock.json
 package.json
-
+.DS_Store
+output_stage1_masks_logging/
+output_stage2_intra_oyster/
+patching.py
