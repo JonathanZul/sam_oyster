@@ -14,3 +14,4 @@ package.json
 output_stage1_masks_logging/
 output_stage2_intra_oyster/
 patching.py
+test_*.py
